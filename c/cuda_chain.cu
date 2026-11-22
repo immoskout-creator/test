@@ -49,12 +49,18 @@ extern "C" int coli_cuda_moe_stage(int device, void *stage, size_t slot_bytes, i
 extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream);
 
+#include "qwen36_cuda_profile.h"
+extern "C" int coli_cuda_enable_qwen36(int device, int enabled);
+extern "C" void coli_cuda_set_qwen36_mask(int device, unsigned mask);
+extern "C" void coli_cuda_set_l2_fetch(int device, int enabled);
+
 struct CcBuf { int kind, dev; size_t bytes; float *d; void *h; };
 
 namespace {
 #define CC_UP_MARKS 1024   /* host_up's marks in flight (three a promoted expert) */
 struct CcCtx {
-    int device, up, lost, in_frame;
+    unsigned kernel_mask;
+    int device, up, lost, in_frame, device_profile;
     int major, minor;   /* the device's compute capability: cc_attn_fk's tensor cores from 7.0, cc_attn_f2's from 7.5 */
     int f2_big;  /* cc_attn_f2's head dim 256 (66 KiB of shared memory): 1 allowed, -1 refused, 0 not asked */
     int f2_big_h;   /* the same for its float16 cache's kernel */
@@ -72,6 +78,10 @@ struct CcCtx {
      * sync here could wait on a cc_wait_host kernel whose host side comes after this frame) */
     float *adec_old[4]; int adec_n_old;
 };
+static inline bool cc_uses_feature(const CcCtx *c, unsigned feature) {
+    return c->device_profile && (c->kernel_mask & feature);
+}
+
 CcCtx g_cc[COLI_CUDA_MAX_DEVICES];
 /* the retired attention scratches, after the stream was seen to pass the frames that read them */
 static void cc_adec_reap(CcCtx *c) {
@@ -1754,6 +1764,57 @@ __global__ static void cc_ew_k(float *__restrict__ y, const float *__restrict__ 
 __device__ __forceinline__ float cc_wmax(float v) { for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, cc_shfl_xor(v, o)); return v; }
 __device__ __forceinline__ float cc_wsum(float v) { for (int o = 16; o > 0; o >>= 1) v += cc_shfl_xor(v, o); return v; }
 __device__ __forceinline__ int cc_wmin(int v) { for (int o = 16; o > 0; o >>= 1) v = min(v, cc_shfl_xor(v, o)); return v; }
+__global__ static void __launch_bounds__(256) cc_route_256_k(const float *__restrict__ l,
+                                                             int *__restrict__ ids, float *__restrict__ w, CcRoute p) {
+    const float NEG = -3.402823466e38f;
+    __shared__ float rv[16];
+    __shared__ int keepi[16];
+    int s = blockIdx.x;
+    if (s >= p.S) return;
+    int tid = threadIdx.x, lane = tid & 31, sg = tid >> 5;
+    float lv = l[p.l_off + s * p.l_row + tid] / p.temp;
+    float m = cc_wmax(lv);
+    if (lane == 0) rv[sg] = m;
+    __syncthreads();
+    float mx = NEG;
+    #pragma unroll
+    for (int g = 0; g < 8; g++) mx = fmaxf(mx, rv[g]);
+    float v = expf(lv - mx);
+    float acc = cc_wsum(v);
+    if (lane == 0) rv[8 + sg] = acc;
+    __syncthreads();
+    float sum = 0.f;
+    #pragma unroll
+    for (int g = 0; g < 8; g++) sum += rv[8 + g];
+    float sc = v / sum;
+    float pk = isnan(sc) ? NEG : sc;
+    int my_id = -1;
+    float my_w = 0.f, wsum = 0.f;
+    for (int k = 0; k < p.K; k++) {
+        float wm = cc_wmax(pk);
+        int we = cc_wmin(pk == wm && wm > NEG ? tid : 0x7fffffff);
+        int h = (k & 1) * 8;
+        if (lane == 0) { rv[h + sg] = wm; keepi[h + sg] = we; }
+        __syncthreads();
+        float b = NEG; int c = -1;
+        #pragma unroll
+        for (int g = 0; g < 8; g++) {
+            float u = rv[h + g]; int ie = keepi[h + g];
+            if (u > NEG && ie != 0x7fffffff && (u > b || (u == b && ie < c))) { b = u; c = ie; }
+        }
+        float wk = c >= 0 ? b : 0.f;
+        wsum += wk;
+        if (tid == k) { my_id = c; my_w = wk; }
+        if (c == tid) pk = NEG;
+    }
+    if (tid < p.K) {
+        float div = wsum + p.norm_eps;
+        bool norm = (p.norm == 1 || (p.norm == 2 && p.K > 1)) && div > 0.f;
+        float x = norm ? my_w / div : my_w;
+        ids[p.i_off + s * p.i_row + tid] = my_id;
+        w[p.w_off + s * p.w_row + tid] = x * p.scale;
+    }
+}
 __global__ static void __launch_bounds__(256) cc_route_k(const float *__restrict__ l, const float *__restrict__ bias,
                                                          int *__restrict__ ids, float *__restrict__ w, CcRoute p) {
     COLI_PDL_WAIT();
@@ -2003,9 +2064,14 @@ __global__ static void __launch_bounds__(256) cc_matmul_rows_k(float *__restrict
 }
 
 /* ---- contexts ------------------------------------------------------------------- */
+static int cc_select_qwen36_profile(int enable);
 static int cc_init(int device) {
     CcCtx *c = ctx_of(device);
-    if (c && c->up) { g_cur = (int)(c - g_cc); return !c->lost; }
+    if (c && c->up) {
+        g_cur = (int)(c - g_cc);
+        if (c->device_profile) (void)cc_select_qwen36_profile(0);
+        return !c->lost;
+    }
     if (!c) {
         if (g_ncc >= COLI_CUDA_MAX_DEVICES) return 0;
         c = &g_cc[g_ncc];
@@ -2028,6 +2094,52 @@ static int cc_init(int device) {
     g_cur = (int)(c - g_cc);
     return 1;
 }
+static int cc_probe_qwen36_profile_(void) {
+    CcCtx *c = cur();
+    if (!c || !c->up || c->lost) return Q36_GPU_NONE;
+    int profile = Q36_GPU_NONE;
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, c->device) == cudaSuccess)
+        profile = q36_cuda_device_profile(c->major, c->minor, prop.name, prop.totalGlobalMem);
+    else (void)cudaGetLastError();
+#endif
+    return profile;
+}
+static int cc_select_qwen36_profile(int enable) {
+    if (!enable) {
+        CcCtx *c = cur();
+        if (c && c->up && c->device_profile) {
+            /* Recovery can have marked the chain lost before disabling the device profile. */
+            if (!c->lost) (void)live();
+            (void)coli_cuda_enable_qwen36(c->device, 0);
+            c->device_profile = Q36_GPU_NONE;
+            c->kernel_mask = 0;
+        }
+        return Q36_GPU_NONE;
+    }
+    CcCtx *c = live();
+    if (!c) return Q36_GPU_NONE;
+    int profile = cc_probe_qwen36_profile_();
+    if (c->device_profile != profile)
+        c->device_profile = coli_cuda_enable_qwen36(c->device, profile != Q36_GPU_NONE)
+            ? profile : Q36_GPU_NONE;
+    if (c->device_profile) {
+        c->kernel_mask = q36_default_features(c->device_profile);
+        coli_cuda_set_qwen36_mask(c->device, c->kernel_mask);
+    }
+    return c->device_profile;
+}
+static void cc_set_kernel_mask_(unsigned mask) {
+    CcCtx *c = live();
+    if (!c || !c->device_profile || c->kernel_mask == mask) return;
+    const bool change_l2 = ((c->kernel_mask ^ mask) & Q36_PROMPT_CACHE) != 0;
+    c->kernel_mask = mask;
+    coli_cuda_set_qwen36_mask(c->device, mask);
+    const char *gran = getenv("COLI_CUDA_L2_GRAN");
+    if (change_l2 && !(gran && *gran))
+        coli_cuda_set_l2_fetch(c->device, (mask & Q36_PROMPT_CACHE) != 0);
+}
 static int cc_ready(void) { CcCtx *c = cur(); return c && c->up && !c->lost; }
 static int cc_lost_(void) { CcCtx *c = cur(); return !c || !c->up || c->lost; }
 static void cc_shutdown(void) {
@@ -2048,6 +2160,8 @@ static void cc_shutdown(void) {
             if (c->adec) cudaFree(c->adec);
             cc_adec_reap(c);
         }
+        if (c->device_profile) (void)coli_cuda_enable_qwen36(c->device, 0);
+        c->device_profile = 0;
         c->adec = nullptr; c->adec_bytes = 0;
         (void)cudaGetLastError();
         c->up = 0; c->ev_ok = 0; c->cs_ok = 0;
@@ -2982,7 +3096,15 @@ static int cc_route(CcBuf *l, CcBuf *bias, CcBuf *ids, CcBuf *w, const CcRoute *
         (p->n_group > 1 && (p->n_group > 64 || p->E % p->n_group || p->topk_group < 1 || p->topk_group > p->n_group))) return 0;
     if ((size_t)(p->l_off + (p->S - 1) * p->l_row + p->E) * 4 > l->bytes || (size_t)(p->i_off + (p->S - 1) * p->i_row + p->K) * 4 > ids->bytes ||
         (size_t)(p->w_off + (p->S - 1) * p->w_row + p->K) * 4 > w->bytes) return 0;
-    coli_launch(cc_route_k, (unsigned)p->S, 256, 0, c->stream, fp(l), fp(bias), (int *)ids->d, fpw(w), *p);
+    if (c->device_profile && p->E == 256 && p->K <= 32 && p->kind == 0 && p->has_bias == 0 && p->n_group <= 1) {
+        const char *e = getenv("COLI_CUDA_ROUTE_FAST");
+        const bool fast = e ? *e != '0' : (c->kernel_mask & Q36_EXPERT_ROUTE) != 0;
+        if (fast) {
+            cc_route_256_k<<<(unsigned)p->S, 256, 0, c->stream>>>(fp(l), (int *)fpw(ids), fpw(w), *p);
+            return launched(c, "route");
+        }
+    }
+    coli_launch(cc_route_k, (unsigned)p->S, 256, 0, c->stream, fp(l), fp(bias), (int *)fpw(ids), fpw(w), *p);
     return launched(c, "route");
 }
 static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, CcBuf *hy, const CcMoe *p) {
@@ -3745,5 +3867,8 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_sconv, cc_relattn, cc_ink2_mix, cc_ink2_clip, cc_ink2_dconv,
     cc_fetch_at, cc_fetch_wait_at, cc_fetch_done_at,
     cc_ink2_caps_,
+    nullptr, nullptr, cc_select_qwen36_profile, cc_set_kernel_mask_,
+    nullptr, /* packed native INT8 operation */
+    cc_probe_qwen36_profile_,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
